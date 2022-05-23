@@ -16,6 +16,8 @@ import os, sys
 import numpy as np
 import cv2
 from time import sleep, time
+from threading import Thread
+from collections import deque
 from multiprocessing import Process, Event, active_children
 from imutils.video import FileVideoStream
 from imutils.object_detection import non_max_suppression
@@ -25,10 +27,12 @@ glbl_streamParms = {
 	'resize':  	None,
 	'detect':	False,
 	'savedir':	None,
-	'playtime':	10
+	'playtime':	10,
+	'interval': 0.5
 }
 
 glbl_subType = 0
+glbl_timeOut = None
 
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -38,11 +42,12 @@ def log(message):
 	print(f"{datetime.now().replace(microsecond=0)} {message}")
 
 
-def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, playtime=10):
-	log(f"[{name}] Starting video stream ... ")
+def frameRead(stream, queue):
+	while stream.running():
+		queue.append(stream.read())
 
-	cv2.namedWindow(name)
-	cv2.startWindowThread()
+def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, playtime=10, interval=0):
+	log(f"[{name}] Starting video stream ... ")
 
 	vs = FileVideoStream(url).start()
 
@@ -50,6 +55,8 @@ def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, pl
 		log(f"[{name}] Failed to start Video stream.")
 		return
 
+	frameQueue = deque(maxlen=1)
+	Thread(target=frameRead, args=(vs, frameQueue,), daemon=True).start()
 	# let the buffer fill up a bit
 	#sleep(1.0)
 
@@ -57,11 +64,14 @@ def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, pl
 	frameRate = float(vs.stream.get(cv2.CAP_PROP_FPS))
 	frameWidth  = int(vs.stream.get(cv2.CAP_PROP_FRAME_WIDTH))
 	frameHeight = int(vs.stream.get(cv2.CAP_PROP_FRAME_HEIGHT))
-	#log("--- Capturing input stream {}x{} @ {:.1f} frameRate".format(frameWidth, frameHeight, frameRate))
+	#log(f"[{name}] Capturing input stream {frameWidth}x{frameHeight} @ {frameRate:.1f} frameRate")
 
 	# resize if parameters are given
 	if resize and len(resize) == 2:
-		frameWidth, frameHeight = resize
+		if (frameWidth, frameHeight) == resize:
+			resize = False
+		else:
+			(frameWidth, frameHeight) = resize
 
 	if detect:
 		# initialize the HOG descriptor/person detector
@@ -86,10 +96,13 @@ def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, pl
 	else:
 		out = None
 
+	cv2.namedWindow(name)
+	cv2.startWindowThread()
+
 	stopped = False
 	starttime = time()
 
-	log(f"[{name}] Connected. Streaming video data ... ")
+	#log(f"[{name}] Connected. Streaming video data ... ")
 	# loop over the video stream frames
 	while vs.running():
 		try:
@@ -107,10 +120,17 @@ def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, pl
 				log(f"[{name}] Timer reset due to new event while streaming.")
 
 			# read frame from video stream
-			frame = vs.read()
+			#frame = vs.read()
+
+			try:
+				frame = frameQueue.pop()
+			except IndexError: #deque is empty
+				# use prevframe = frame if not None?
+				continue
 
 			# and resize it
 			if resize and len(resize) == 2:
+				#frame = cv2.resize(frame, (frameWidth, framHeight))
 				frame = cv2.resize(frame, resize)
 
 			if detect:
@@ -138,11 +158,14 @@ def showStream(url, name, eventStop, resize=None, detect=False, savedir=None, pl
 
 			# show the output frame
 			cv2.imshow(name, frame)
-			#cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)
+			cv2.setWindowProperty(name, cv2.WND_PROP_TOPMOST, 1)
 
 			# if the `q` key was pressed, break from the loop
 			if (cv2.waitKey(1) & 0xFF) == ord("q"):
 				break
+
+			if interval > 0:
+				sleep(interval)
 
 		except KeyboardInterrupt:
 			break
@@ -227,7 +250,10 @@ class LoginError(Exception):
 
 class EventMonitor():
 	def __init__(self, camera, **streamParms):
-		self.EVENTMGR_URL = 'http://{host}:{port}/cgi-bin/eventManager.cgi?action=attach&codes=[{events}]'
+		if camera['timeout']:
+			self.EVENTMGR_URL = 'http://{host}:{port}/cgi-bin/eventManager.cgi?action=attach&codes=[{events}]&heartbeat={timeout}'
+		else:
+			self.EVENTMGR_URL = 'http://{host}:{port}/cgi-bin/eventManager.cgi?action=attach&codes=[{events}]'
 
 		self.Camera = camera
 		self.Lifeview = None
@@ -237,6 +263,7 @@ class EventMonitor():
 
 		self.process = None
 		self.streamParms = streamParms
+		self.timeout = int(camera['timeout']) + 5 if camera['timeout'] else None
 
 
 	def onConnect(self):
@@ -248,7 +275,7 @@ class EventMonitor():
 
 	def onDisconnect(self, reason):
 		if self.Lifeview:
-			log(f"[{self.Camera['name']}] Disconnected from event manager on {self.Camera['host']}. Reason: {reason}.")
+			log(f"[{self.Camera['name']}] Disconnected from event manager on {self.Camera['host']}. Reason: {reason}")
 			self.Lifeview.stop()
 			self.Lifeview = None
 		self.Connected = False
@@ -284,7 +311,8 @@ class EventMonitor():
 				if i > 1:
 					log(f"[{self.Camera['name']}] Retrying ...")
 				try:
-					response = session.get(self.URL, timeout=(3.05, None), stream=True, verify=True)
+					#response = session.get(self.URL, timeout=(3.05, None), stream=True, verify=True)
+					response = session.get(self.URL, timeout=(3.05, self.timeout), stream=True, verify=True)
 					if response.status_code == 401:
 						raise LoginError
 					response.raise_for_status()
@@ -303,6 +331,7 @@ class EventMonitor():
 
 	def _lines(self, response):
 		line = ''
+
 		for char in response.iter_content(decode_unicode=True):
 			line = line + char
 			if line.endswith('\r\n'):
@@ -328,9 +357,10 @@ class EventMonitor():
 					response.encoding = 'utf-8'
 
 				try:
+					self.onConnect()
 					for line in self._lines(response):
-						if line == 'HTTP/1.1 200 OK':
-							self.onConnect()
+						#if line == 'HTTP/1.1 200 OK':
+						#	self.onConnect()
 
 						if not line.startswith('Code='):
 							continue
@@ -348,8 +378,9 @@ class EventMonitor():
 					reason = "User terminated"
 					break
 				except Exception as e:
-					reason = e
-					break
+					reason = str(e)
+					if not 'Read timed out.' in reason:
+						break
 				finally:
 					self.onDisconnect(reason)
 					response.close()
@@ -376,6 +407,8 @@ if __name__ == '__main__':
 		help="name or path of the config file (default: camera.cfg)")
 	ap.add_argument("-d", "--detect", action="store_true",
 		help="enable people detection (default: False)")
+	ap.add_argument("-i", "--interval", type=float, default=0,
+		help="time interval in seconds between video frames (default: 0)")
 	ap.add_argument("-o", "--out", type=str, default=None,
 		help="output directory of the saved video stream (default: No saving) ")
 	ap.add_argument("-p", "--playtime", type=int, default=10,
@@ -384,12 +417,15 @@ if __name__ == '__main__':
 		help="resize output format: WidthxHeight (default: No resizing)")
 	ap.add_argument("-s", "--subtype", type=int, default=0,
 		help="subtype of the stream to use: 0=HighRes, 1=LowRes (default: 0))")
+	ap.add_argument("-t", "--timeout", type=int, default=0,
+		help="heartbeat/reply timeout in seconds (default: 0=no timeout)")
 	ap.add_argument("-q", "--quiet", action="store_true",
 		help="suppresses console output (default: False)")
 	args = vars(ap.parse_args())
 
 	glbl_streamParms['detect'] = args['detect']
 	glbl_streamParms['playtime'] = args['playtime']
+	glbl_streamParms['interval'] = args['interval']
 
 	try:
 		glbl_streamParms['resize'] = tuple([int(x) for x in args['resize'].lower().split('x')])
@@ -404,6 +440,7 @@ if __name__ == '__main__':
 		glbl_streamParms['savedir'] = None
 
 	glbl_subType = args['subtype']
+	glbl_timeOut = args['timeout'] or None
 
 	configFile = args['config']
 	if not os.path.isfile(configFile):
@@ -432,7 +469,8 @@ if __name__ == '__main__':
 			  'password':	config.get(section, 'password'),
 			  'auth': 		config.get(section, 'auth', fallback='digest'),
 			  'events': 	config.get(section, 'events', fallback='VideoMotion'),
-			  'subtype':	glbl_subType
+			  'subtype':	glbl_subType,
+			  'timeout':	glbl_timeOut
 			}
 			log(f"[{section}] Config okay.")
 		except:
